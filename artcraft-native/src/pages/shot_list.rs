@@ -114,7 +114,7 @@ impl ShotListDoc {
     let mut rows: Vec<[String; 6]> = Vec::with_capacity(self.shots.len() + 1);
     rows.push(["#".into(), "Title".into(), "Duration".into(), "Camera".into(), "Status".into(), "Description".into()]);
     for (i, shot) in self.shots.iter().enumerate() {
-      rows.push([(i + 1).to_string(), shot.title.clone(), format_duration(shot.duration_secs), shot.camera.clone(), shot.status.label().to_owned(), one_line(&shot.description)]);
+      rows.push([(i + 1).to_string(), escape_cell(&one_line(&shot.title)), format_duration(shot.duration_secs), escape_cell(&one_line(&shot.camera)), shot.status.label().to_owned(), escape_cell(&one_line(&shot.description))]);
     }
     pad_table(&rows)
   }
@@ -129,7 +129,11 @@ impl ShotListDoc {
       fs::create_dir_all(parent).map_err(|e| e.to_string())?;
     }
     let text = serde_json::to_string_pretty(self).map_err(|e| e.to_string())?;
-    fs::write(path, text).map_err(|e| e.to_string())
+    let mut temp_path = path.as_os_str().to_os_string();
+    temp_path.push(".tmp");
+    let temp_path = PathBuf::from(temp_path);
+    fs::write(&temp_path, text).map_err(|e| e.to_string())?;
+    fs::rename(&temp_path, path).map_err(|e| e.to_string())
   }
 }
 
@@ -150,7 +154,10 @@ impl ShotListPage {
     let (doc, notice) = match ShotListDoc::load(&path) {
       Ok(doc) => (doc, None),
       Err(_) if !path.exists() => (ShotListDoc::default(), None),
-      Err(err) => (ShotListDoc::default(), Some(format!("Couldn't read the shot list: {err}"))),
+      Err(err) => {
+        let _ = fs::copy(&path, data_root.join(format!("{STORE_NAME}.corrupt")));
+        (ShotListDoc::default(), Some(format!("Couldn't read the shot list: {err}. The unreadable file was kept as a .corrupt copy.")))
+      },
     };
     let selected = doc.shots.first().map(|s| s.id.clone());
     Self { path, doc, selected, query: String::new(), filter: None, dirty: false, notice }
@@ -422,6 +429,10 @@ fn one_line(text: &str) -> String {
   text.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
+fn escape_cell(text: &str) -> String {
+  text.replace('\\', "\\\\").replace('|', "\\|").replace('`', "\\`")
+}
+
 fn pad_table(rows: &[[String; 6]]) -> String {
   let mut widths = [0usize; 6];
   for row in rows {
@@ -507,17 +518,61 @@ mod tests {
   }
 
   #[test]
+  fn markdown_escapes_cells() {
+    let mut doc = ShotListDoc::default();
+    for text in ["A | B", "# Close-up", "`Detail` \\| end"] {
+      doc.add(format!("{text}\nshot"));
+      let shot = doc.shots.last_mut().unwrap();
+      shot.description = format!("{text}\nnotes");
+      shot.camera = format!("{text}\ncamera");
+    }
+    let md = doc.to_markdown();
+    let rows: Vec<_> = md.lines().filter(|line| line.starts_with('|')).collect();
+    assert_eq!(rows.len(), 5);
+    for row in &rows {
+      assert_eq!(unescaped_pipes(row), 7, "{row}");
+      assert_eq!(row.len(), rows[0].len(), "{row}");
+    }
+    for suffix in ["shot", "notes", "camera"] {
+      assert!(md.contains(&format!("A \\| B {suffix}")));
+      assert!(md.contains(&format!("# Close-up {suffix}")));
+      assert!(md.contains(&format!("\\`Detail\\` \\\\\\| end {suffix}")));
+    }
+  }
+
+  #[test]
+  fn empty_markdown_has_only_header_and_separator() {
+    assert_eq!(ShotListDoc::default().to_markdown(), "# Shot List\n\n| # | Title | Duration | Camera | Status | Description |\n| - | ----- | -------- | ------ | ------ | ----------- |\n");
+  }
+
+  #[test]
   fn round_trips_through_json() {
     let dir = std::env::temp_dir().join(format!("artcraft-shot-list-{}", uuid::Uuid::new_v4()));
     fs::create_dir_all(&dir).unwrap();
-    let path = dir.join("shot_list.json");
+    let path = dir.join(STORE_NAME);
     let mut doc = ShotListDoc::default();
     doc.add("A");
     doc.shots[0].status = ShotStatus::Shooting;
     doc.save(&path).unwrap();
     let loaded = ShotListDoc::load(&path).unwrap();
-    assert_eq!(loaded.shots[0].title, "A");
-    assert_eq!(loaded.shots[0].status, ShotStatus::Shooting);
+    assert_eq!(loaded, doc);
+    assert!(!dir.join(format!("{STORE_NAME}.tmp")).exists());
+    fs::remove_dir_all(&dir).unwrap();
+  }
+
+  #[test]
+  fn corrupt_store_starts_empty_and_keeps_copy() {
+    let dir = std::env::temp_dir().join(format!("artcraft-shot-corrupt-{}", uuid::Uuid::new_v4()));
+    fs::create_dir_all(&dir).unwrap();
+    let contents = "{ unreadable shot list";
+    fs::write(dir.join(STORE_NAME), contents).unwrap();
+    let page = ShotListPage::new(&dir);
+    assert!(page.doc.shots.is_empty());
+    assert!(page.selected.is_none());
+    assert!(page.notice.as_deref().unwrap().starts_with("Couldn't read the shot list:"));
+    assert!(page.notice.as_deref().unwrap().contains("kept as a .corrupt copy"));
+    assert_eq!(fs::read_to_string(dir.join(format!("{STORE_NAME}.corrupt"))).unwrap(), contents);
+    fs::remove_dir_all(&dir).unwrap();
   }
 
   #[test]
@@ -551,6 +606,21 @@ mod tests {
     assert_eq!(ShotStatus::ALL.map(ShotStatus::label), ["Idea", "Ready", "Shooting", "Done"]);
     assert_eq!(format_duration(125), "2:05");
     assert_eq!(format_duration(8), "0:08");
+  }
+
+  fn unescaped_pipes(text: &str) -> usize {
+    let mut count = 0;
+    let mut escaped = false;
+    for ch in text.chars() {
+      if escaped {
+        escaped = false;
+      } else if ch == '\\' {
+        escaped = true;
+      } else if ch == '|' {
+        count += 1;
+      }
+    }
+    count
   }
 
   fn build(page: ShotListPage) -> Harness<'static, State> {
