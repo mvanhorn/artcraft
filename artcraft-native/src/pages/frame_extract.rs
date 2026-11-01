@@ -1,6 +1,8 @@
 //! Frame Extract: pull stills from a local video. Works offline; FFmpeg on the PATH does the
 //! decoding (the same tools in-app playback already uses).
 
+use std::fs::{File, OpenOptions};
+use std::io::{self, ErrorKind};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::mpsc::{Receiver, TryRecvError, channel};
@@ -415,9 +417,9 @@ impl FrameExtractPage {
       return;
     };
     for frame in &self.frames {
-      if let Some(name) = frame.path.file_name() {
-        if let Err(err) = std::fs::copy(&frame.path, dir.join(name)) {
-          warn!("Couldn't save {}: {err}", name.to_string_lossy());
+      if let Some(name) = frame.path.file_name().and_then(|n| n.to_str()) {
+        if let Err(err) = copy_without_overwrite(&frame.path, &dir, name) {
+          warn!("Couldn't save {name}: {err}");
         }
       }
     }
@@ -471,6 +473,27 @@ pub fn format_time_precise(secs: f64) -> String {
 pub fn frame_file_name(index: u32, timestamp: f64) -> String {
   let stamp = format_time_precise(timestamp).replace([':', '.'], "-");
   format!("frame-{:02}-{stamp}.png", index + 1)
+}
+
+/// Copies `src` into `dir` as `name`, or as `name-2`, `name-3`, ... when that file already
+/// exists. Never overwrites; returns the path written.
+pub fn copy_without_overwrite(src: &Path, dir: &Path, name: &str) -> io::Result<PathBuf> {
+  let mut input = File::open(src)?;
+  let base = Path::new(name);
+  let stem = base.file_stem().and_then(|s| s.to_str()).unwrap_or(name);
+  let ext = base.extension().and_then(|e| e.to_str()).map(|e| format!(".{e}")).unwrap_or_default();
+  let mut n = 1u32;
+  loop {
+    let dest = if n == 1 { dir.join(name) } else { dir.join(format!("{stem}-{n}{ext}")) };
+    match OpenOptions::new().write(true).create_new(true).open(&dest) {
+      Ok(mut out) => {
+        io::copy(&mut input, &mut out)?;
+        return Ok(dest);
+      },
+      Err(err) if err.kind() == ErrorKind::AlreadyExists => n += 1,
+      Err(err) => return Err(err),
+    }
+  }
 }
 
 /// Writes one PNG at `timestamp` seconds into `output`.
@@ -594,6 +617,27 @@ mod tests {
     assert_eq!(format_time_precise(-1.0), "00:00.000");
     assert_eq!(frame_file_name(0, 1.5), "frame-01-00-01-500.png");
     assert_eq!(frame_file_name(9, 0.0), "frame-10-00-00-000.png");
+  }
+
+  #[test]
+  fn save_adds_numeric_suffix_instead_of_overwriting() {
+    let dir = tempfile::tempdir().unwrap();
+    let src = dir.path().join("src.png");
+    std::fs::write(&src, b"new").unwrap();
+    let out = dir.path().join("out");
+    std::fs::create_dir(&out).unwrap();
+    std::fs::write(out.join("frame-01.png"), b"old").unwrap();
+    std::fs::write(out.join("frame-01-2.png"), b"old2").unwrap();
+
+    let first = copy_without_overwrite(&src, &out, "frame-01.png").unwrap();
+    assert_eq!(first, out.join("frame-01-3.png"));
+    assert_eq!(std::fs::read(out.join("frame-01.png")).unwrap(), b"old");
+    assert_eq!(std::fs::read(out.join("frame-01-2.png")).unwrap(), b"old2");
+    assert_eq!(std::fs::read(&first).unwrap(), b"new");
+
+    let fresh = copy_without_overwrite(&src, &out, "frame-02.png").unwrap();
+    assert_eq!(fresh, out.join("frame-02.png"));
+    assert!(copy_without_overwrite(&src, &dir.path().join("missing"), "frame-03.png").is_err());
   }
 
   #[test]
